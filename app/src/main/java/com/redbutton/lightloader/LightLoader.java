@@ -4,6 +4,9 @@ import java.lang.instrument.Instrumentation;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.util.jar.JarFile;
+import java.util.Properties;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.net.URISyntaxException;
@@ -18,8 +21,11 @@ import java.util.logging.Logger;
 public final class LightLoader {
     private static final String DEFAULT_MINECRAFT_VERSION = "26.2";
     private static final String MOD_SERVICE = "META-INF/services/" + ModInitializer.class.getName();
+    private static final String TRANSFORMER_SERVICE = "META-INF/services/" + ClassTransformer.class.getName();
+    private static final String MOD_METADATA = "META-INF/lightloader.mod.properties";
     private static final Logger LOGGER = Logger.getLogger("LightLoader");
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean();
+    private static LoaderContext context;
     private static ModClassLoader modClassLoader;
 
     private LightLoader() {
@@ -38,10 +44,25 @@ public final class LightLoader {
         LOGGER.info("LightLoader " + Client.VERSION + " starting"
                 + (options == null || options.isBlank() ? "" : " with options: " + options));
         Path modsDirectory = modsDirectory();
-        LoaderContext context = new LoaderContext(instrumentation, modsDirectory, worldDirectory());
+        context = new LoaderContext(instrumentation, modsDirectory, worldDirectory());
+        context.worldEvents().onJoin(worldName -> context.chat().send(
+            "LightLoader " + Client.VERSION + " loaded"));
         initializeVersionAdapter(context);
-        ServiceLoader.load(ModInitializer.class).forEach(initializer -> initialize(initializer, context));
         initializeExternalMods(context);
+        ServiceLoader.load(ModInitializer.class).forEach(initializer -> initialize(initializer, context));
+    }
+
+    public static void onWorldJoin(String worldName) {
+        LoaderContext currentContext = context;
+        if (currentContext == null) {
+            LOGGER.warning("Ignoring world join before LightLoader initialization");
+            return;
+        }
+        currentContext.worldEvents().fireJoin(worldName);
+    }
+
+    public static void onWorldJoin() {
+        onWorldJoin("");
     }
 
     private static void initializeVersionAdapter(LoaderContext context) {
@@ -57,6 +78,7 @@ public final class LightLoader {
 
     private static void initialize(VersionAdapter adapter, LoaderContext context) {
         try {
+            adapter.install(context);
             adapter.initialize(context);
             LOGGER.info("Initialized Minecraft adapter " + adapter.minecraftVersion());
         } catch (RuntimeException exception) {
@@ -83,12 +105,63 @@ public final class LightLoader {
             }
 
             modClassLoader = new ModClassLoader(modUrls.toArray(URL[]::new), LightLoader.class.getClassLoader());
-            ServiceLoader.load(ModInitializer.class, modClassLoader)
-                    .forEach(initializer -> initialize(initializer, context));
+                registerTransformers(context);
+            for (URL modUrl : modUrls) {
+                initializeMod(modUrl, context);
+            }
             LOGGER.info("Scanned " + modUrls.size() + " mod JAR(s)");
         } catch (IOException | RuntimeException exception) {
             LOGGER.log(Level.SEVERE, "Could not scan mods directory " + modsDirectory, exception);
         }
+    }
+
+    private static void initializeMod(URL modUrl, LoaderContext context) {
+        try (JarFile jar = new JarFile(Path.of(modUrl.toURI()).toFile())) {
+            if (jar.getEntry(MOD_METADATA) != null) {
+                Properties properties = new Properties();
+                try (InputStream stream = jar.getInputStream(jar.getEntry(MOD_METADATA))) {
+                    properties.load(stream);
+                }
+                ModMetadata metadata = ModMetadata.from(properties);
+                if (!metadata.minecraftVersion().equals(System.getProperty(
+                        "lightloader.minecraftVersion", DEFAULT_MINECRAFT_VERSION))) {
+                    LOGGER.warning("Skipping mod " + metadata.id() + ": Minecraft version mismatch");
+                    return;
+                }
+                Class<?> entrypoint = Class.forName(metadata.entrypoint(), true, modClassLoader);
+                initialize((ModInitializer) entrypoint.getDeclaredConstructor().newInstance(), context);
+                LOGGER.info("Loaded mod " + metadata.id() + " " + metadata.version());
+                return;
+            }
+
+            ServiceLoader.load(ModInitializer.class, modClassLoader).stream()
+                    .map(ServiceLoader.Provider::get)
+                    .filter(initializer -> initializer.getClass().getProtectionDomain()
+                            .getCodeSource().getLocation().equals(modUrl))
+                    .forEach(initializer -> initialize(initializer, context));
+        } catch (ReflectiveOperationException | IOException | java.net.URISyntaxException exception) {
+            LOGGER.log(Level.SEVERE, "Could not load mod JAR " + modUrl, exception);
+        }
+    }
+
+    private static void registerTransformers(LoaderContext context) {
+        if (context.instrumentation() == null) {
+            return;
+        }
+        ServiceLoader.load(ClassTransformer.class, modClassLoader)
+                .forEach(transformer -> context.instrumentation().addTransformer(new java.lang.instrument.ClassFileTransformer() {
+                    @Override
+                    public byte[] transform(Module module, ClassLoader classLoader, String className,
+                            Class<?> classBeingRedefined, java.security.ProtectionDomain protectionDomain,
+                            byte[] classfileBuffer) {
+                        try {
+                            return transformer.transform(className, classfileBuffer);
+                        } catch (RuntimeException exception) {
+                            LOGGER.log(Level.SEVERE, "Transformer failed for " + className, exception);
+                            return null;
+                        }
+                    }
+                }, true));
     }
 
     private static Path modsDirectory() {
@@ -124,7 +197,7 @@ public final class LightLoader {
 
         @Override
         public java.util.Enumeration<URL> getResources(String name) throws IOException {
-            if (MOD_SERVICE.equals(name)) {
+            if (MOD_SERVICE.equals(name) || TRANSFORMER_SERVICE.equals(name) || MOD_METADATA.equals(name)) {
                 return findResources(name);
             }
             return super.getResources(name);

@@ -11,6 +11,7 @@ public final class LoaderContext {
     private final CommandManager commands;
     private final ModStorage storage;
     private final CreativeTabRegistry creativeTabs;
+    private final WorldEvents worldEvents;
 
     LoaderContext(Instrumentation instrumentation, Path modsDirectory, Path worldDirectory) {
         this.instrumentation = instrumentation;
@@ -18,6 +19,7 @@ public final class LoaderContext {
         this.commands = new CommandManager();
         this.storage = new ModStorage(modsDirectory, worldDirectory);
         this.creativeTabs = new CreativeTabRegistry();
+        this.worldEvents = new WorldEvents();
     }
 
     public Logger logger(String modId) {
@@ -42,5 +44,9 @@ public final class LoaderContext {
 
     public CreativeTabRegistry creativeTabs() {
         return creativeTabs;
+    }
+
+    public WorldEvents worldEvents() {
+        return worldEvents;
     }
 }
